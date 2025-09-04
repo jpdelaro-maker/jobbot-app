@@ -1,0 +1,14 @@
+# Ignorer l'environnement virtuel
+.venv/
+
+# Ignorer fichiers temporaires Python
+__pycache__/
+*.pyc
+
+# Ignorer les exports (CSV/Excel)
+*.csv
+*.xlsx
+
+# Ignorer fichiers de config perso
+.env
+jobs.sqlite
