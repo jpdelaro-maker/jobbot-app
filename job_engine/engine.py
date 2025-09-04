@@ -1,247 +1,366 @@
-import sys, asyncio
-if sys.platform.startswith("win"):
-    # Corrige l'erreur NotImplementedError sur Windows (Python 3.13)
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# job_engine/engine.py
+# Version "Cloud-friendly" — pas de Playwright, uniquement requests + BeautifulSoup
 
-import re, pandas as pd
-from datetime import datetime
-from urllib.parse import quote_plus
-from playwright.sync_api import sync_playwright
+import re
+import time
+import random
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
 
-# ---------- Helpers ----------
-def build_regex_list(terms):
-    if not terms: return []
-    safe=[re.escape(t) for t in terms]
-    return [rf"\b({'|'.join(safe)})\b"]
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 
-def regex_any(patterns, text):
+# -----------------------------------------------------------------------------
+# Logging (collecte des logs en mémoire pour affichage dans Streamlit)
+# -----------------------------------------------------------------------------
+_LOGS: List[str] = []
+
+def log(msg: str):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] {msg}"
+    _LOGS.append(line)
+    print(line, flush=True)
+
+# -----------------------------------------------------------------------------
+# Outils regex & scoring
+# -----------------------------------------------------------------------------
+def build_regex_list(terms: List[str]) -> List[str]:
+    """Construit une liste de patterns OR avec \b … \b à partir d'une liste."""
+    safe = [re.escape(t) for t in terms if t.strip()]
+    return [rf"\b({'|'.join(safe)})\b"] if safe else []
+
+def regex_any(patterns: List[str], text: str) -> bool:
     return any(re.search(p, text or "", flags=re.I) for p in patterns)
 
-class Logger:
-    def __init__(self): self.lines=[]
-    def log(self, msg):
-        line=f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-        print(line, flush=True); self.lines.append(line)
+def within_days(date_iso: str, max_days: int) -> bool:
+    if not date_iso:
+        return True
+    try:
+        dt = datetime.fromisoformat(date_iso.replace("Z", ""))
+        return (datetime.utcnow() - dt) <= timedelta(days=max_days)
+    except Exception:
+        return True
 
-def iter_keyword_queries(keywords):
-    """Une requête par mot-clé (entre guillemets) pour éviter l'AND global."""
+# -----------------------------------------------------------------------------
+# Réseau
+# -----------------------------------------------------------------------------
+_UA_LIST = [
+    # quelques UA récents
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+]
+
+def fetch(url: str, timeout: int = 25) -> str:
+    """GET simple avec headers ; renvoie html (ou '' en cas d'erreur)."""
+    headers = {
+        "User-Agent": random.choice(_UA_LIST),
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        return r.text
+    except requests.RequestException as e:
+        log(f"[NET] {url} -> {e}")
+        return ""
+
+# -----------------------------------------------------------------------------
+# Scrapers (requests + BS4)
+# NB: certains sites rendent peu de HTML sans JS. On tente plusieurs sélecteurs.
+# -----------------------------------------------------------------------------
+def scrape_apec(keywords: List[str], max_pages: int = 1) -> List[Dict]:
+    rows = []
+    base = "https://www.apec.fr/candidat/recherche-emploi.html/emploi"
     for kw in keywords:
-        kw=kw.strip()
-        if kw:
-            yield kw, quote_plus(f'"{kw}"')
+        q = requests.utils.quote(f"\"{kw}\"")
+        url = f"{base}?motsCles={q}&lieux=France&sortsType=DATE"
+        log(f"[APEC] {kw} → {url}")
+        html = fetch(url)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "lxml")
 
-def accept_cookies(page):
-    sels = [
-        "#onetrust-accept-btn-handler","button#onetrust-accept-btn-handler",
-        "#didomi-notice-agree-button","[data-testid='uc-accept-all-button']",
-        "button:has-text('Tout accepter')","button:has-text(\"J'accepte\")",
-        ".qc-cmp2-summary-accept"
-    ]
-    for s in sels:
-        try:
-            page.locator(s).first.click(timeout=1000)
-            return True
-        except Exception:
-            pass
-    return False
+        # essais de sélecteurs
+        cards = (
+            soup.select("[data-testid='search-results'] article")
+            or soup.select("article a[href*='/offre/']")  # fallback
+        )
+        log(f"[APEC] BRUT pour '{kw}': {len(cards)} cartes")
 
-# ---------- Scoring ----------
-def score_row(row, cfg):
-    title=row.get("title",""); company=row.get("company",""); location=row.get("location","") or ""
-    desc=f"{title} {company} {location}"
-    url=row.get("url","")
+        for c in cards:
+            # selon les pages, h3 / a / attributs varient
+            title_el = c.select_one("h3") or c.select_one("a")
+            link = c.select_one("a[href]")
+            comp = c.select_one("[data-testid='company-name']") or c.select_one(".company")
+            loc = c.select_one("[data-testid='job-location']") or c.select_one(".location")
+            date_el = c.select_one("time[datetime]")
 
-    # Exclusions bloquantes
-    if regex_any(cfg["EXCLUSIONS"], title) or regex_any(cfg["EXCLUSIONS"], desc): return 0
-    if regex_any(cfg["CONTRACT_EXCLUDE"], desc): return 0
-    if any(u for u in cfg["ALREADY_APPLIED_URLS"] if u and u in url): return 0
+            title = (title_el.get_text(" ", strip=True) if title_el else "").strip() or "Sans titre"
+            href = link["href"] if link and link.has_attr("href") else ""
+            if href.startswith("/"):
+                href = "https://www.apec.fr" + href
 
-    s=0
-    # Must-have
-    if regex_any(cfg["MUST_HAVE"], title): s+=40
-    elif regex_any(cfg["MUST_HAVE"], desc): s+=30
-    else: s-=10
+            rows.append({
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
+                "location": loc.get_text(strip=True) if loc else "France",
+                "url": href,
+                "published_at": date_el["datetime"] if date_el and date_el.has_attr("datetime") else None,
+                "source": "apec",
+            })
 
-    # filet sécurité : présence d’UN keyword dans le titre
-    if any(k.lower() in title.lower() for k in cfg["KEYWORDS"]): s+=20
+        time.sleep(0.8)  # petite pause anti-anti-bot
+    return rows
 
-    # Autres critères
-    if regex_any(cfg["SENIORITY"], desc): s+=15
-    if regex_any(cfg["CONTRACT_PREFER"], desc): s+=10
-    if regex_any(cfg["NICE_TO_HAVE"], desc): s+=15
-    if regex_any(cfg["REMOTE_OK"], desc): s+=5
-    if cfg["CITIES_BONUS"] and regex_any(cfg["CITIES_BONUS"], (location or "").lower()): s+=10
-    if regex_any(cfg["COMPANY_WHITELIST"], company): s+=10
-    if regex_any(cfg["COMPANY_BLACKLIST"], company): s-=20
+def scrape_indeed(keywords: List[str]) -> List[Dict]:
+    rows = []
+    base = "https://fr.indeed.com/jobs"
+    for kw in keywords:
+        q = requests.utils.quote(f"\"{kw}\"")
+        url = f"{base}?q={q}&l=France&sort=date"
+        log(f"[Indeed] {kw} → {url}")
+        html = fetch(url)
+        if not html:
+            continue
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # quelques variations de sélecteurs
+        cards = (
+            soup.select("a.jcs-JobTitle")
+            or soup.select("h2.jobTitle a")
+            or soup.select("a[href*='/rc/clk']")
+            or soup.select("a[href*='/pagead/']")
+        )
+        log(f"[Indeed] BRUT pour '{kw}': {len(cards)} cartes")
+
+        for a in cards:
+            title = a.get_text(" ", strip=True) or "Sans titre"
+            href = a.get("href", "")
+            if href.startswith("/"):
+                href = "https://fr.indeed.com" + href
+
+            parent = a.find_parent(["div", "article"]) or a
+            comp = parent.select_one(".companyName, [data-testid='company-name']")
+            loc = parent.select_one(".companyLocation, [data-testid='text-location']")
+
+            rows.append({
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
+                "location": loc.get_text(strip=True) if loc else "France",
+                "url": href,
+                "published_at": None,
+                "source": "indeed",
+            })
+        time.sleep(0.8)
+    return rows
+
+def scrape_wttj(keywords: List[str]) -> List[Dict]:
+    rows = []
+    base = "https://www.welcometothejungle.com/fr/jobs"
+    for kw in keywords:
+        q = requests.utils.quote(kw)
+        url = f"{base}?query={q}&aroundQuery=France&sortBy=publication"
+        log(f"[WTTJ] {kw} → {url}")
+        html = fetch(url)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "lxml")
+
+        cards = soup.select("article a[href*='/fr/offres-emploi/']")
+        log(f"[WTTJ] BRUT pour '{kw}': {len(cards)} cartes")
+
+        for a in cards:
+            title = a.get_text(" ", strip=True) or "Sans titre"
+            href = a.get("href", "")
+            if href.startswith("/"):
+                href = "https://www.welcometothejungle.com" + href
+            parent = a.find_parent("article") or a
+            comp = parent.select_one("[data-testid='company-name']")
+            loc = parent.select_one("[data-testid='job-location']")
+
+            rows.append({
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
+                "location": loc.get_text(strip=True) if loc else "France",
+                "url": href,
+                "published_at": None,
+                "source": "wttj",
+            })
+        time.sleep(0.8)
+    return rows
+
+def scrape_hellowork(keywords: List[str]) -> List[Dict]:
+    rows = []
+    base = "https://www.hellowork.com/fr-fr/emploi/recherche.html"
+    for kw in keywords:
+        q = requests.utils.quote(kw)
+        url = f"{base}?k={q}&l=France&sort=DATE"
+        log(f"[HelloWork] {kw} → {url}")
+        html = fetch(url)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "lxml")
+
+        cards = soup.select("article a[href*='/offres/'], article a[href*='/emploi/'], a[data-cy='offerLink']")
+        log(f"[HelloWork] BRUT pour '{kw}': {len(cards)} cartes")
+
+        for a in cards:
+            title = a.get_text(" ", strip=True) or "Sans titre"
+            href = a.get("href", "")
+            if href.startswith("/"):
+                href = "https://www.hellowork.com" + href
+            parent = a.find_parent("article") or a
+            comp = parent.select_one("[data-cy='companyName']")
+            loc = parent.select_one("[data-cy='jobLocation']")
+            date_el = parent.select_one("time[datetime]")
+
+            rows.append({
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
+                "location": loc.get_text(strip=True) if loc else "France",
+                "url": href,
+                "published_at": date_el["datetime"] if date_el and date_el.has_attr("datetime") else None,
+                "source": "hellowork",
+            })
+        time.sleep(0.8)
+    return rows
+
+# -----------------------------------------------------------------------------
+# Scoring & filtre (inspiré de ta version précédente)
+# -----------------------------------------------------------------------------
+def score_row(row: Dict,
+              MUST_HAVE: List[str],
+              NICE_TO_HAVE: List[str],
+              EXCLUSIONS: List[str],
+              SENIORITY: List[str],
+              CONTRACT_PREFER: List[str],
+              CONTRACT_EXCLUDE: List[str],
+              REMOTE_OK: List[str],
+              CITIES_BONUS: List[str],
+              KEYWORDS: List[str]) -> int:
+    title = row.get("title", "") or ""
+    company = row.get("company", "") or ""
+    location = (row.get("location", "") or "").lower()
+    desc = f"{title} {company} {location}"
+
+    # exclusions
+    if regex_any(EXCLUSIONS, desc) or regex_any(CONTRACT_EXCLUDE, desc):
+        return 0
+
+    s = 0
+    # must-have
+    if regex_any(MUST_HAVE, title):
+        s += 40
+    elif regex_any(MUST_HAVE, desc):
+        s += 30
+    else:
+        s -= 10
+
+    # filet sécurité : mot-clé brut dans le titre
+    t_low = title.lower()
+    if any(k.lower() in t_low for k in KEYWORDS):
+        s += 20
+
+    if regex_any(SENIORITY, desc):
+        s += 15
+    if regex_any(CONTRACT_PREFER, desc):
+        s += 10
+    if regex_any(NICE_TO_HAVE, desc):
+        s += 15
+    if regex_any(REMOTE_OK, desc):
+        s += 5
+    if regex_any(CITIES_BONUS, location):
+        s += 10
 
     return max(0, min(100, s))
 
-def matches_filters(row, cfg):
-    s=score_row(row,cfg); row["score"]=s
-    return s>=cfg["MIN_SCORE"]
-
-# ---------- Scrapers ----------
-def scrape_indeed(page, cfg, logger):
-    rows=[]; seen=set()
-    for kw_txt, kw_q in iter_keyword_queries(cfg["KEYWORDS"]):
-        url=f"https://fr.indeed.com/jobs?q={kw_q}&l=France&sort=date"
-        logger.log(f"[Indeed] {kw_txt}")
-        page.goto(url, timeout=90000)
-        accept_cookies(page)
-        try: page.wait_for_selector("a[data-jk], div.job_seen_beacon a[href]", timeout=12000)
-        except Exception: pass
-        for _ in range(3): page.mouse.wheel(0,1800); page.wait_for_timeout(350)
-        cards = page.locator("a[data-jk], div.job_seen_beacon a[href]")
-        n = min(cards.count(), 60)
-        for i in range(n):
-            a=cards.nth(i)
-            title=(a.inner_text(timeout=700) or "Sans titre").strip()
-            href=a.get_attribute("href") or ""
-            parent=a.locator("..")
-            try: comp=parent.locator(".companyName, [data-testid='company-name']").first.inner_text(timeout=400).strip()
-            except Exception: comp=""
-            try: loc =parent.locator(".companyLocation, [data-testid='text-location']").first.inner_text(timeout=400).strip()
-            except Exception: loc="France"
-            url_abs=("https://fr.indeed.com"+href) if href.startswith("/") else href
-            if not url_abs or url_abs in seen: continue
-            row={"title":title,"company":comp,"location":loc,"url":url_abs,"published_at":None,"source":"indeed"}
-            if matches_filters(row,cfg): seen.add(url_abs); rows.append(row)
-    logger.log(f"Indeed: {len(rows)} retenues")
-    return rows
-
-def scrape_apec(page, cfg, logger):
-    rows=[]; seen=set()
-    for kw_txt, kw_q in iter_keyword_queries(cfg["KEYWORDS"]):
-        url=f"https://www.apec.fr/candidat/recherche-emploi.html/emploi?motsCles={kw_q}&lieux=France&sortsType=DATE"
-        logger.log(f"[APEC] {kw_txt}")
-        page.goto(url, timeout=90000)
-        accept_cookies(page)
-        try: page.wait_for_selector("[data-testid='search-results'] article, article", timeout=12000)
-        except Exception: pass
-        for _ in range(3): page.mouse.wheel(0,1600); page.wait_for_timeout(350)
-        cards = page.locator("[data-testid='search-results'] article")
-        if cards.count()==0: cards=page.locator("article")
-        n = min(cards.count(), 60)
-        for i in range(n):
-            c=cards.nth(i)
-            title=(c.locator("h3").first.inner_text(timeout=600) if c.locator("h3").count() else "Sans titre").strip()
-            link = c.locator("a[href]").first if c.locator("a[href]").count() else None
-            href = link.get_attribute("href") if link else ""
-            comp =(c.locator("[data-testid='company-name']").first.inner_text(timeout=400)
-                   if c.locator("[data-testid='company-name']").count() else "").strip()
-            loc  =(c.locator("[data-testid='job-location']").first.inner_text(timeout=400)
-                   if c.locator("[data-testid='job-location']").count() else "France").strip()
-            url_abs=("https://www.apec.fr"+href) if (href or "").startswith("/") else (href or "")
-            if not url_abs or url_abs in seen: continue
-            row={"title":title,"company":comp,"location":loc,"url":url_abs,"published_at":None,"source":"apec"}
-            if matches_filters(row,cfg): seen.add(url_abs); rows.append(row)
-    logger.log(f"APEC: {len(rows)} retenues")
-    return rows
-
-def scrape_wttj(page, cfg, logger):
-    rows=[]; seen=set()
-    for kw_txt, kw_q in iter_keyword_queries(cfg["KEYWORDS"]):
-        url=f"https://www.welcometothejungle.com/fr/jobs?query={kw_q}&aroundQuery=France&sortBy=publication"
-        logger.log(f"[WTTJ] {kw_txt}")
-        page.goto(url, timeout=90000)
-        accept_cookies(page)
-        try: page.wait_for_selector("article a[href*='/fr/offres-emploi/']", timeout=12000)
-        except Exception: pass
-        for _ in range(3): page.mouse.wheel(0,1600); page.wait_for_timeout(350)
-        cards = page.locator("article a[href*='/fr/offres-emploi/']")
-        n = min(cards.count(), 60)
-        for i in range(n):
-            a=cards.nth(i)
-            title=(a.inner_text(timeout=700) or "Sans titre").strip()
-            href=a.get_attribute("href") or ""
-            parent=a.locator("..").locator("..")
-            try: comp=parent.locator("[data-testid='company-name'], [data-testid='job-card-company-name']").first.inner_text(timeout=400).strip()
-            except Exception: comp=""
-            try: loc =parent.locator("[data-testid='job-location'], [data-testid='job-card-location']").first.inner_text(timeout=400).strip()
-            except Exception: loc="France"
-            url_abs=("https://www.welcometothejungle.com"+href) if href.startswith("/") else href
-            if not url_abs or url_abs in seen: continue
-            row={"title":title,"company":comp,"location":loc,"url":url_abs,"published_at":None,"source":"wttj"}
-            if matches_filters(row,cfg): seen.add(url_abs); rows.append(row)
-    logger.log(f"WTTJ: {len(rows)} retenues")
-    return rows
-
-def scrape_hellowork(page, cfg, logger):
-    rows=[]; seen=set()
-    for kw_txt, kw_q in iter_keyword_queries(cfg["KEYWORDS"]):
-        url=f"https://www.hellowork.com/fr-fr/emploi/recherche.html?k={kw_q}&l=France&sort=DATE"
-        logger.log(f"[HelloWork] {kw_txt}")
-        page.goto(url, timeout=90000)
-        accept_cookies(page)
-        try: page.wait_for_selector("article a[href*='/offres/'], a[data-cy='offerLink']", timeout=12000)
-        except Exception: pass
-        for _ in range(3): page.mouse.wheel(0,1600); page.wait_for_timeout(350)
-        cards = page.locator("article a[href*='/offres/'], a[data-cy='offerLink']")
-        n = min(cards.count(), 60)
-        for i in range(n):
-            a=cards.nth(i)
-            title=(a.inner_text(timeout=700) or "Sans titre").strip()
-            href=a.get_attribute("href") or ""
-            parent=a.locator("..")
-            try: comp=parent.locator("[data-cy='companyName'], [class*='company']").first.inner_text(timeout=400).strip()
-            except Exception: comp=""
-            try: loc =parent.locator("[data-cy='jobLocation'], [class*='location']").first.inner_text(timeout=400).strip()
-            except Exception: loc="France"
-            url_abs=("https://www.hellowork.com"+href) if (href or "").startswith("/") else (href or "")
-            if not url_abs or url_abs in seen: continue
-            row={"title":title,"company":comp,"location":loc,"url":url_abs,"published_at":None,"source":"hellowork"}
-            if matches_filters(row,cfg): seen.add(url_abs); rows.append(row)
-    logger.log(f"HelloWork: {len(rows)} retenues")
-    return rows
-
-# ---------- Entrée principale ----------
-def run_search(config):
+# -----------------------------------------------------------------------------
+# Moteur principal
+# -----------------------------------------------------------------------------
+def run_search(cfg: Dict) -> Tuple[pd.DataFrame, str]:
     """
-    config = {
-      KEYWORDS, SITES, CITIES_BONUS, MIN_SCORE, MUST_HAVE, NICE_TO_HAVE, EXCLUSIONS,
-      SENIORITY, CONTRACT_PREFER, CONTRACT_EXCLUDE, REMOTE_OK,
-      COMPANY_WHITELIST, COMPANY_BLACKLIST, ALREADY_APPLIED_URLS
-    }
+    cfg attend les clés :
+      - KEYWORDS (List[str])
+      - MIN_SCORE (int)
+      - MUST_HAVE / NICE_TO_HAVE / EXCLUSIONS / SENIORITY / CONTRACT_PREFER / CONTRACT_EXCLUDE / REMOTE_OK (List[str] patterns)
+      - CITIES_BONUS (List[str] patterns)
+      - MAX_AGE_DAYS (int) optionnel
+      - SOURCES (List[str]) optionnel parmi: apec, indeed, wttj, hellowork
     """
-    logger=Logger()
-    logger.log(f"Keywords: {', '.join(config.get('KEYWORDS', []))}")
-    logger.log(f"Sites: {', '.join(config.get('SITES', []))}")
+    _LOGS.clear()
+    KEYWORDS = cfg.get("KEYWORDS", [])
+    MIN_SCORE = int(cfg.get("MIN_SCORE", 40))
+    MAX_AGE_DAYS = int(cfg.get("MAX_AGE_DAYS", 14))
+    SOURCES = cfg.get("SOURCES", ["apec", "indeed", "wttj", "hellowork"])
 
-    site_funcs = {
-        "apec": scrape_apec,
-        "indeed": scrape_indeed,
-        "wttj": scrape_wttj,
-        "hellowork": scrape_hellowork,
-    }
-    selected = [site_funcs[s] for s in config.get("SITES", []) if s in site_funcs]
+    MUST_HAVE = cfg.get("MUST_HAVE", [])
+    NICE_TO_HAVE = cfg.get("NICE_TO_HAVE", [])
+    EXCLUSIONS = cfg.get("EXCLUSIONS", [])
+    SENIORITY = cfg.get("SENIORITY", [])
+    CONTRACT_PREFER = cfg.get("CONTRACT_PREFER", [])
+    CONTRACT_EXCLUDE = cfg.get("CONTRACT_EXCLUDE", [])
+    REMOTE_OK = cfg.get("REMOTE_OK", [])
+    CITIES_BONUS = cfg.get("CITIES_BONUS", [])
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage","--no-sandbox"])
-        context = browser.new_context(
-            locale="fr-FR",
-            timezone_id="Europe/Paris",
-            viewport={"width":1366,"height":900},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/123.0.0.0 Safari/537.36")
-        )
-        page = context.new_page()
+    log("=== DÉMARRAGE (requests+BS4) ===")
+    log(f"Keywords: {KEYWORDS}")
+    all_rows: List[Dict] = []
 
-        all_rows=[]
-        for func in selected:
-            try:
-                all_rows.extend(func(page, config, logger))
-            except Exception as e:
-                logger.log(f"[WARN] {func.__name__}: {e}")
+    try:
+        if "apec" in SOURCES:
+            all_rows += scrape_apec(KEYWORDS)
+    except Exception as e:
+        log(f"[WARN] APEC: {e}")
 
-        browser.close()
+    try:
+        if "indeed" in SOURCES:
+            all_rows += scrape_indeed(KEYWORDS)
+    except Exception as e:
+        log(f"[WARN] Indeed: {e}")
 
-    # dédup & tri
-    uniq={}
+    try:
+        if "wttj" in SOURCES:
+            all_rows += scrape_wttj(KEYWORDS)
+    except Exception as e:
+        log(f"[WARN] WTTJ: {e}")
+
+    try:
+        if "hellowork" in SOURCES:
+            all_rows += scrape_hellowork(KEYWORDS)
+    except Exception as e:
+        log(f"[WARN] HelloWork: {e}")
+
+    # dédup par URL
+    uniq = {}
     for r in all_rows:
-        u=r.get("url","")
-        if u and u not in uniq: uniq[u]=r
-    df=pd.DataFrame(list(uniq.values()))
-    if not df.empty:
-        df=df.sort_values(by=["score","source","title"], ascending=[False,True,True])
-    return df, "\n".join(logger.lines)
+        u = r.get("url", "")
+        if u and u not in uniq:
+            uniq[u] = r
+    rows = list(uniq.values())
+    log(f"Total brut (dédupliqué): {len(rows)}")
+
+    # scoring + filtrage
+    kept = []
+    for r in rows:
+        r["score"] = score_row(
+            r, MUST_HAVE, NICE_TO_HAVE, EXCLUSIONS, SENIORITY,
+            CONTRACT_PREFER, CONTRACT_EXCLUDE, REMOTE_OK, CITIES_BONUS, KEYWORDS
+        )
+        if r["score"] >= MIN_SCORE and within_days(r.get("published_at"), MAX_AGE_DAYS):
+            kept.append(r)
+    log(f"Conservés (score ≥ {MIN_SCORE}): {len(kept)}")
+
+    if kept:
+        kept.sort(key=lambda x: (-x.get("score", 0), x.get("source", ""), x.get("title", "")))
+        df = pd.DataFrame(kept)
+    else:
+        df = pd.DataFrame(columns=["title", "company", "location", "url", "published_at", "source", "score"])
+
+    # retourne DataFrame + logs texte
+    return df, "\n".join(_LOGS)
