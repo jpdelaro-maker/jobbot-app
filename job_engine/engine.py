@@ -4,7 +4,6 @@
 import re
 import time
 import random
-import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 
@@ -27,7 +26,7 @@ def log(msg: str):
 # Outils regex & scoring
 # -----------------------------------------------------------------------------
 def build_regex_list(terms: List[str]) -> List[str]:
-    """Construit une liste de patterns OR avec \b … \b à partir d'une liste."""
+    """Construit une liste de patterns OR avec \\b … \\b à partir d'une liste."""
     safe = [re.escape(t) for t in terms if t.strip()]
     return [rf"\b({'|'.join(safe)})\b"] if safe else []
 
@@ -42,7 +41,8 @@ def within_days(date_iso: str, max_days: int) -> bool:
         return (datetime.utcnow() - dt) <= timedelta(days=max_days)
     except Exception:
         return True
-def _sanitize_keywords(raw_list):
+
+def _sanitize_keywords(raw_list: List[str]) -> List[str]:
     """Nettoie les mots-clés : supprime guillemets et espaces en trop."""
     cleaned = []
     for k in raw_list or []:
@@ -94,6 +94,7 @@ def fetch(url: str, timeout: int = 25) -> str:
             log(f"[NET] tentative {attempt+1} {url} -> {e}")
             time.sleep(0.8 + random.random())
     return ""
+
 # -----------------------------------------------------------------------------
 # Scrapers (requests + BS4)
 # NB: certains sites rendent peu de HTML sans JS. On tente plusieurs sélecteurs.
@@ -119,7 +120,7 @@ def scrape_apec(keywords: List[str], max_pages: int = 1) -> List[Dict]:
 
         soup = BeautifulSoup(html, "lxml")
         cards = soup.select("[data-testid='search-results'] article") or soup.select("article")
-        log(f"[APEC] BRUT pour '{kw}': {len(cards)} cartes")
+        log(f"[APEC] BRUT pour '{kw}': {len(cards)} cartes}")
 
         for c in cards:
             title_el = c.select_one("h3, h2, a")
@@ -143,7 +144,6 @@ def scrape_apec(keywords: List[str], max_pages: int = 1) -> List[Dict]:
             })
         time.sleep(0.6)
     return rows
-
 
 def scrape_indeed(keywords: List[str]) -> List[Dict]:
     rows = []
@@ -184,7 +184,6 @@ def scrape_indeed(keywords: List[str]) -> List[Dict]:
         time.sleep(0.6)
     return rows
 
-
 def scrape_wttj(keywords: List[str]) -> List[Dict]:
     rows = []
     base = "https://www.welcometothejungle.com/fr/jobs"
@@ -212,9 +211,12 @@ def scrape_wttj(keywords: List[str]) -> List[Dict]:
             comp = parent.select_one("[data-testid='company-name']")
             loc  = parent.select_one("[data-testid='job-location']")
             rows.append({
-                "title": title, "company": comp.get_text(strip=True) if comp else "",
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
                 "location": loc.get_text(strip=True) if loc else "France",
-                "url": href, "published_at": None, "source": "wttj",
+                "url": href,
+                "published_at": None,
+                "source": "wttj",
             })
         time.sleep(0.6)
     return rows
@@ -247,17 +249,18 @@ def scrape_hellowork(keywords: List[str]) -> List[Dict]:
             loc  = parent.select_one("[data-cy='jobLocation'], [class*='location']")
             date_el = parent.select_one("time[datetime]")
             rows.append({
-                "title": title, "company": comp.get_text(strip=True) if comp else "",
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
                 "location": loc.get_text(strip=True) if loc else "France",
-                "url": href, "published_at": (date_el["datetime"] if date_el and date_el.has_attr("datetime") else None),
+                "url": href,
+                "published_at": (date_el["datetime"] if date_el and date_el.has_attr("datetime") else None),
                 "source": "hellowork",
             })
         time.sleep(0.6)
     return rows
 
-
 # -----------------------------------------------------------------------------
-# Scoring & filtre (inspiré de ta version précédente)
+# Scoring & filtre
 # -----------------------------------------------------------------------------
 def score_row(row: Dict,
               MUST_HAVE: List[str],
@@ -287,7 +290,7 @@ def score_row(row: Dict,
     else:
         s -= 10
 
-    # filet sécurité : mot-clé brut dans le titre
+    # filet de sécurité : mot-clé brut dans le titre
     t_low = title.lower()
     if any(k.lower() in t_low for k in KEYWORDS):
         s += 20
@@ -316,14 +319,16 @@ def run_search(cfg: Dict) -> Tuple[pd.DataFrame, str]:
       - MUST_HAVE / NICE_TO_HAVE / EXCLUSIONS / SENIORITY / CONTRACT_PREFER / CONTRACT_EXCLUDE / REMOTE_OK (List[str] patterns)
       - CITIES_BONUS (List[str] patterns)
       - MAX_AGE_DAYS (int) optionnel
-      - SOURCES (List[str]) optionnel parmi: apec, indeed, wttj, hellowork
+      - SOURCES ou SITES (List[str]) optionnel parmi: apec, indeed, wttj, hellowork
     """
     _LOGS.clear()
+
     KEYWORDS = _sanitize_keywords(cfg.get("KEYWORDS", []))
-log(f"Keywords (nettoyés): {KEYWORDS}")
+    log(f"Keywords (nettoyés): {KEYWORDS}")
+
     MIN_SCORE = int(cfg.get("MIN_SCORE", 40))
     MAX_AGE_DAYS = int(cfg.get("MAX_AGE_DAYS", 14))
-    SOURCES = cfg.get("SOURCES", ["apec", "indeed", "wttj", "hellowork"])
+    SOURCES = cfg.get("SOURCES") or cfg.get("SITES") or ["apec", "indeed", "wttj", "hellowork"]
 
     MUST_HAVE = cfg.get("MUST_HAVE", [])
     NICE_TO_HAVE = cfg.get("NICE_TO_HAVE", [])
