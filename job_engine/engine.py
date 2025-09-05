@@ -42,6 +42,21 @@ def within_days(date_iso: str, max_days: int) -> bool:
         return (datetime.utcnow() - dt) <= timedelta(days=max_days)
     except Exception:
         return True
+def _sanitize_keywords(raw_list):
+    """Nettoie les mots-clés : supprime guillemets et espaces en trop."""
+    cleaned = []
+    for k in raw_list or []:
+        if not k:
+            continue
+        s = k.strip()
+        # supprime les guillemets normaux ou typographiques
+        s = s.replace("“", "").replace("”", "").replace("„", "")
+        s = s.replace("'", "").replace('"', "")
+        # supprime espaces multiples
+        s = re.sub(r"\s+", " ", s).strip()
+        if s:
+            cleaned.append(s)
+    return cleaned
 
 # -----------------------------------------------------------------------------
 # Réseau
@@ -304,7 +319,8 @@ def run_search(cfg: Dict) -> Tuple[pd.DataFrame, str]:
       - SOURCES (List[str]) optionnel parmi: apec, indeed, wttj, hellowork
     """
     _LOGS.clear()
-    KEYWORDS = cfg.get("KEYWORDS", [])
+    KEYWORDS = _sanitize_keywords(cfg.get("KEYWORDS", []))
+log(f"Keywords (nettoyés): {KEYWORDS}")
     MIN_SCORE = int(cfg.get("MIN_SCORE", 40))
     MAX_AGE_DAYS = int(cfg.get("MAX_AGE_DAYS", 14))
     SOURCES = cfg.get("SOURCES", ["apec", "indeed", "wttj", "hellowork"])
