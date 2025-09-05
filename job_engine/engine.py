@@ -120,7 +120,7 @@ def scrape_apec(keywords: List[str], max_pages: int = 1) -> List[Dict]:
 
         soup = BeautifulSoup(html, "lxml")
         cards = soup.select("[data-testid='search-results'] article") or soup.select("article")
-        log(f"[APEC] BRUT pour '{kw}': {len(cards)} cartes}")
+        log(f"[APEC] BRUT pour '{kw}': {len(cards)} cartes")
 
         for c in cards:
             title_el = c.select_one("h3, h2, a")
