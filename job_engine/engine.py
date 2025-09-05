@@ -54,21 +54,31 @@ _UA_LIST = [
 ]
 
 def fetch(url: str, timeout: int = 25) -> str:
-    """GET simple avec headers ; renvoie html (ou '' en cas d'erreur)."""
+    """GET avec headers + petites retries; renvoie html ('' si échec)."""
     headers = {
         "User-Agent": random.choice(_UA_LIST),
         "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://www.google.com/",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
     }
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-        r.raise_for_status()
-        return r.text
-    except requests.RequestException as e:
-        log(f"[NET] {url} -> {e}")
-        return ""
-
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            if r.status_code == 403:
+                log(f"[NET] 403 sur tentative {attempt+1} → UA rotate & pause")
+                time.sleep(1.0 + random.random())
+                headers["User-Agent"] = random.choice(_UA_LIST)
+                continue
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as e:
+            log(f"[NET] tentative {attempt+1} {url} -> {e}")
+            time.sleep(0.8 + random.random())
+    return ""
 # -----------------------------------------------------------------------------
 # Scrapers (requests + BS4)
 # NB: certains sites rendent peu de HTML sans JS. On tente plusieurs sélecteurs.
@@ -82,7 +92,7 @@ def scrape_apec(keywords: List[str], max_pages: int = 1) -> List[Dict]:
     rows = []
     base = "https://www.apec.fr/candidat/recherche-emploi.html/emploi"
     for kw in keywords:
-        q = requests.utils.quote(kw)  # ⚠️ pas de guillemets stricts
+        q = requests.utils.quote(kw)  # ⚠️ pas de guillemets !
         url = f"{base}?motsCles={q}&lieux=France&sortsType=DATE"
         log(f"[APEC] {kw} → {url}")
         html = fetch(url)
@@ -109,19 +119,22 @@ def scrape_apec(keywords: List[str], max_pages: int = 1) -> List[Dict]:
                 href = "https://www.apec.fr" + href
 
             rows.append({
-                "title": title, "company": comp.get_text(strip=True) if comp else "",
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
                 "location": loc.get_text(strip=True) if loc else "France",
-                "url": href, "published_at": (date_el["datetime"] if date_el and date_el.has_attr("datetime") else None),
+                "url": href,
+                "published_at": (date_el["datetime"] if date_el and date_el.has_attr("datetime") else None),
                 "source": "apec",
             })
         time.sleep(0.6)
     return rows
 
+
 def scrape_indeed(keywords: List[str]) -> List[Dict]:
     rows = []
     base = "https://fr.indeed.com/jobs"
     for kw in keywords:
-        q = requests.utils.quote(kw)  # ⚠️ pas de guillemets
+        q = requests.utils.quote(kw)  # ⚠️ pas de guillemets !
         url = f"{base}?q={q}&l=France&sort=date"
         log(f"[Indeed] {kw} → {url}")
         html = fetch(url)
@@ -146,12 +159,16 @@ def scrape_indeed(keywords: List[str]) -> List[Dict]:
             comp = parent.select_one(".companyName, [data-testid='company-name']")
             loc  = parent.select_one(".companyLocation, [data-testid='text-location']")
             rows.append({
-                "title": title, "company": comp.get_text(strip=True) if comp else "",
+                "title": title,
+                "company": comp.get_text(strip=True) if comp else "",
                 "location": loc.get_text(strip=True) if loc else "France",
-                "url": href, "published_at": None, "source": "indeed",
+                "url": href,
+                "published_at": None,
+                "source": "indeed",
             })
         time.sleep(0.6)
     return rows
+
 
 def scrape_wttj(keywords: List[str]) -> List[Dict]:
     rows = []
